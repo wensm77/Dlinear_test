@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.pycache/
+lightning_logs/
+
+# generated outputs
+data/data_cleaned.csv
+forecast_results.csv
+metrics.csv
