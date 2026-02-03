@@ -8,4 +8,7 @@ lightning_logs/
 # generated outputs
 data/data_cleaned.csv
 forecast_results.csv
+forecast_results_improved.csv
 metrics.csv
+metrics_improved.csv
+metrics_segments_improved.csv
