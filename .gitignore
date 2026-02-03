@@ -9,6 +9,8 @@ lightning_logs/
 data/data_cleaned.csv
 forecast_results.csv
 forecast_results_improved.csv
+forecast_results_deep.csv
 metrics.csv
 metrics_improved.csv
 metrics_segments_improved.csv
+metrics_deep.csv

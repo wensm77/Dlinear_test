@@ -4,6 +4,7 @@
 
 1. `src/train.py`：baseline（保留不动，便于对比）
 2. `src/train_improved.py`：改进版（Huber/MAE + 间歇序列回退 + 分层指标）
+3. `src/train_deep.py`：深度学习版（NHiTS/PatchTST + 融合 + 首月准确率）
 3. 数据清洗（每个 SKU 仅在自身有效区间补 0，避免全局尾部补 0）
 4. 在 notebook 中可视化预测与真实值对比
 
@@ -86,6 +87,8 @@ python data/clean_data_v2.py --input ./data/data_all.csv --output ./data/data_cl
 python src/train.py --data ./data/data_cleaned.csv --horizon 12 --input-size 18 --n-windows 1
 # 或使用改进版
 python src/train_improved.py --data ./data/data_cleaned.csv --horizon 12 --input-size 18 --n-windows 2 --step-size 3
+# 或使用深度学习版
+python src/train_deep.py --data ./data/data_cleaned.csv --models nhits,patchtst --horizon 12 --input-size 24 --n-windows 2 --step-size 3
 ```
 
 如果你的数据文件未来超过 GitHub 单文件限制（100MB），建议使用 Git LFS。
@@ -95,6 +98,24 @@ python src/train_improved.py --data ./data/data_cleaned.csv --horizon 12 --input
 运行完训练后打开 `draw.ipynb`，它会：
 
 - 自动读取 `data/data_cleaned.csv` 与预测结果文件（可切换 baseline/improved）
+
+## 7) 深度学习版（推荐在中快流件上试）
+
+```bash
+python src/train_deep.py \
+  --data ./data/data_cleaned.csv \
+  --models nhits,patchtst \
+  --horizon 12 \
+  --input-size 24 \
+  --n-windows 2 \
+  --step-size 3 \
+  --loss huber \
+  --huber-delta 5.0 \
+  --cv-output ./forecast_results_deep.csv \
+  --metrics-output ./metrics_deep.csv
+```
+
+`metrics_deep.csv` 除了常规指标外，还包含 `FirstMonthAccuracy`（每个 SKU 预测期第一个月按业务公式计算后取平均）。
 - 自动识别预测列（如 `DLinear`）
 - 绘制 Top SKU 的「历史 + 真实未来 + 预测未来」曲线
 - 绘制全量聚合层面的预测对比与误差指标
