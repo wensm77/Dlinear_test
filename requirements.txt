@@ -2,3 +2,4 @@ neuralforecast>=1.7.0
 pandas>=2.0
 numpy>=1.24
 torch>=2.1
+matplotlib>=3.7
