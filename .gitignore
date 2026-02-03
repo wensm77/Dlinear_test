@@ -14,3 +14,7 @@ metrics.csv
 metrics_improved.csv
 metrics_segments_improved.csv
 metrics_deep.csv
+forecast_results_deep_exog.csv
+metrics_deep_exog.csv
+data/monthly_feature_panel.csv
+data/data_all_until_202601_fix.csv

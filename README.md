@@ -5,6 +5,7 @@
 1. `src/train.py`：baseline（保留不动，便于对比）
 2. `src/train_improved.py`：改进版（Huber/MAE + 间歇序列回退 + 分层指标）
 3. `src/train_deep.py`：深度学习版（NHiTS/PatchTST + 融合 + 首月准确率）
+4. `src/train_deep_exog.py`：深度学习 + 精选特征版（先月聚合+padding，再训练）
 3. 数据清洗（每个 SKU 仅在自身有效区间补 0，避免全局尾部补 0）
 4. 在 notebook 中可视化预测与真实值对比
 
@@ -116,6 +117,31 @@ python src/train_deep.py \
 ```
 
 `metrics_deep.csv` 除了常规指标外，还包含 `FirstMonthAccuracy`（每个 SKU 预测期第一个月按业务公式计算后取平均）。
+
+## 8) 深度学习 + 精选特征版（中快流件）
+
+先构建月度特征面板（已内置 padding 和防泄漏特征）：
+
+```bash
+python data/build_monthly_feature_panel.py \
+  --input ./data/data_all_until_202601_fix.csv \
+  --output ./data/monthly_feature_panel.csv
+```
+
+再训练：
+
+```bash
+python src/train_deep_exog.py \
+  --data ./data/monthly_feature_panel.csv \
+  --models nhits,patchtst \
+  --horizon 12 \
+  --input-size 24 \
+  --n-windows 1 \
+  --step-size 12 \
+  --loss huber \
+  --cv-output ./forecast_results_deep_exog.csv \
+  --metrics-output ./metrics_deep_exog.csv
+```
 - 自动识别预测列（如 `DLinear`）
 - 绘制 Top SKU 的「历史 + 真实未来 + 预测未来」曲线
 - 绘制全量聚合层面的预测对比与误差指标
