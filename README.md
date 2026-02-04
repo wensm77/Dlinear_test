@@ -145,3 +145,23 @@ python src/train_deep_exog.py \
 - 自动识别预测列（如 `DLinear`）
 - 绘制 Top SKU 的「历史 + 真实未来 + 预测未来」曲线
 - 绘制全量聚合层面的预测对比与误差指标
+
+## 9) PatchTST 两阶段（先判0/非0，再回归）
+
+保留 `src/train_patchtst_only.py` 作为单模型 baseline，新增两阶段版本：
+
+```bash
+python src/train_patchtst_two_stage.py \
+  --data ./data/data_cleaned.csv \
+  --horizon 1 \
+  --input-size 24 \
+  --n-windows 6 \
+  --step-size 1 \
+  --patch-len 4 \
+  --stride 2 \
+  --cls-loss mse \
+  --reg-loss huber \
+  --threshold-grid 0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9 \
+  --cv-output ./forecast_results_patchtst_2stage.csv \
+  --metrics-output ./metrics_patchtst_2stage.csv
+```

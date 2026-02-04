@@ -20,3 +20,5 @@ data/monthly_feature_panel.csv
 data/data_all_until_202601_fix.csv
 forecast_results_patchtst.csv
 metrics_patchtst.csv
+forecast_results_patchtst_2stage.csv
+metrics_patchtst_2stage.csv
