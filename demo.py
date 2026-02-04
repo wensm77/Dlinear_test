@@ -27,10 +27,26 @@ def evaluate_month(df: pd.DataFrame, pred_col: str) -> dict:
     yhat = df[pred_col].to_numpy(dtype=float)
     biz_acc = float(business_acc_vectorized(yhat, y).mean()) if len(df) else np.nan
 
+    full_acc_vec = business_acc_vectorized(yhat, y)
+    nonzero_mask = y != 0
+    if nonzero_mask.any():
+        # 这里可以直接复用 business_acc_vectorized 的结果，只取非零部分
+        # 或者重新计算，公式是一样的：1 - abs(err)/y
+        biz_acc_nonzero = float(full_acc_vec[nonzero_mask].mean())
+    else:
+        biz_acc_nonzero = np.nan
+
+
     actual_pos = y > 0
     pred_pos = yhat > 0
     actual_zero = ~actual_pos
     pred_zero = ~pred_pos
+
+    # === 新增统计 ===
+    count_actual_zero = int(actual_zero.sum())  # label 为 0 的数量
+    count_pred_zero = int(pred_zero.sum())      # 预测为 0 的数量
+    # ===============
+
 
     tp = int((pred_pos & actual_pos).sum())
     fp = int((pred_pos & actual_zero).sum())
@@ -46,8 +62,11 @@ def evaluate_month(df: pd.DataFrame, pred_col: str) -> dict:
         "rows": int(len(df)),
         "sku_count": int(df["unique_id"].nunique()),
         "business_accuracy": biz_acc,
+        "count_actual_zero": count_actual_zero,
+        "count_pred_zero": count_pred_zero,
         "cls_accuracy": safe_div(tp + tn, tp + fp + tn + fn),
         "f1_score": f1,
+        "business_accuracy_nonzero": biz_acc_nonzero,
         "tp": tp,
         "fp": fp,
         "tn": tn,

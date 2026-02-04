@@ -181,3 +181,29 @@ python demo.py \
 - `cls_accuracy`
 - `f1_score`
 - `tp / fp / tn / fn`
+
+## 11) PatchTST 日粒度（中快流件）
+
+先从 `data_all_until_202601_fix.csv` 构建日面板（`id=werks_matnr`，按最后一次 `flow_rate` 过滤中/快流件）：
+
+```bash
+python data/build_daily_panel_midfast.py \
+  --input ./data/data_all_until_202601_fix.csv \
+  --output ./data/daily_midfast_panel.csv \
+  --min-days 750
+```
+
+再训练 PatchTST（日频 `D`，720天输入预测30天）：
+
+```bash
+python src/train_patchtst_daily.py \
+  --data ./data/daily_midfast_panel.csv \
+  --horizon 30 \
+  --input-size 720 \
+  --n-windows 1 \
+  --step-size 30 \
+  --patch-len 30 \
+  --stride 15 \
+  --cv-output ./forecast_results_patchtst_daily.csv \
+  --metrics-output ./metrics_patchtst_daily.csv
+```

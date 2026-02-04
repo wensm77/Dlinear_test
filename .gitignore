@@ -24,3 +24,6 @@ forecast_results_patchtst_2stage.csv
 metrics_patchtst_2stage.csv
 patchtst_2stage_eval*.csv
 patchtst_2stage_monthly_eval.csv
+data/daily_midfast_panel.csv
+forecast_results_patchtst_daily.csv
+metrics_patchtst_daily.csv
