@@ -18,3 +18,5 @@ forecast_results_deep_exog.csv
 metrics_deep_exog.csv
 data/monthly_feature_panel.csv
 data/data_all_until_202601_fix.csv
+forecast_results_patchtst.csv
+metrics_patchtst.csv

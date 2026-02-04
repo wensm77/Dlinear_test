@@ -134,8 +134,13 @@ def main(args):
         "rolling_mean_6",
         "rolling_nonzero_6",
     ]
-    futr_exog_list = ["month_sin", "month_cos", "holiday_days_in_month"]
-    stat_exog_list = ["flow_fast"]
+    futr_exog_list = ["month_sin", "month_cos", "holiday_days_in_month", "flow_fast"]
+    # 兼容当前 NeuralForecast 版本：静态特征需要单独 static_df，这里统一走时变 exog。
+    stat_exog_list = []
+
+    # NeuralForecast 要求除 unique_id/ds 外全部是数值列，这里显式裁剪掉字符串列（如 flow_rate）。
+    model_cols = ["unique_id", "ds", "y"] + hist_exog_list + futr_exog_list + stat_exog_list
+    df = df[model_cols].copy()
 
     min_len = args.input_size + args.horizon + (args.n_windows - 1) * args.step_size
     id_counts = df["unique_id"].value_counts()
@@ -169,6 +174,7 @@ def main(args):
             )
         )
     if "patchtst" in model_names:
+        # PatchTST 当前版本不支持 future exogenous，因此这里仅使用历史窗口内信息。
         models.append(
             PatchTST(
                 h=args.horizon,
@@ -176,9 +182,6 @@ def main(args):
                 max_steps=args.max_steps,
                 learning_rate=args.lr,
                 scaler_type="robust",
-                hist_exog_list=hist_exog_list,
-                futr_exog_list=futr_exog_list,
-                stat_exog_list=stat_exog_list,
                 loss=loss_fn,
                 valid_loss=loss_fn,
                 val_check_steps=args.val_check_steps,

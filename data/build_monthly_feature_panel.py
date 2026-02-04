@@ -47,7 +47,8 @@ def build_panel(input_path: str, output_path: str):
     for c in ["invntry_cnt", "supply_lt", "transportation_lt", "prchs_cycl"]:
         df[c] = _to_num(df[c])
 
-    df["ds"] = df["dt"].dt.to_period("M").dt.to_timestamp("MS")
+    # pandas>=2.0 不支持在 Period.to_timestamp 里传 "MS"，这里固定取月初时间戳。
+    df["ds"] = df["dt"].dt.to_period("M").dt.to_timestamp(how="start")
     df = df.sort_values(["unique_id", "dt"])
 
     monthly = (
