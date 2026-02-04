@@ -165,3 +165,21 @@ python src/train_patchtst_two_stage.py \
   --cv-output ./forecast_results_patchtst_2stage.csv \
   --metrics-output ./metrics_patchtst_2stage.csv
 ```
+
+## 10) 两阶段模型详细评测（混淆矩阵/有销量准确率/整体准确率）
+
+```bash
+python demo.py \
+  --input ./forecast_results_patchtst_2stage.csv \
+  --pred-col yhat_two_stage \
+  --output-prefix ./patchtst_2stage_eval
+```
+
+输出文件包括：
+
+- `patchtst_2stage_eval_overall.csv`：总体指标（overall_acc/pos_acc/zero_acc/WAPE 等）
+- `patchtst_2stage_eval_confusion_overall.csv`：整体分类混淆矩阵
+- `patchtst_2stage_eval_by_ds.csv`：按预测月份评测
+- `patchtst_2stage_eval_by_cutoff.csv`：按回测窗口评测
+- `patchtst_2stage_eval_sku_diagnosis.csv`：按 SKU 诊断
+- `patchtst_2stage_eval_threshold_sweep.csv`：若存在 `p_nonzero + yhat_reg_only`，输出阈值扫描结果
