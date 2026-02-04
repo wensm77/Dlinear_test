@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -22,10 +22,10 @@ def safe_div(num, den):
     return float(num / den) if den else np.nan
 
 
-def evaluate_slice(df: pd.DataFrame, pred_col: str) -> dict:
+def evaluate_month(df: pd.DataFrame, pred_col: str) -> dict:
     y = df["y"].to_numpy(dtype=float)
     yhat = df[pred_col].to_numpy(dtype=float)
-    acc = business_acc_vectorized(yhat, y)
+    biz_acc = float(business_acc_vectorized(yhat, y).mean()) if len(df) else np.nan
 
     actual_pos = y > 0
     pred_pos = yhat > 0
@@ -37,29 +37,21 @@ def evaluate_slice(df: pd.DataFrame, pred_col: str) -> dict:
     tn = int((pred_zero & actual_zero).sum())
     fn = int((pred_zero & actual_pos).sum())
 
-    abs_err = np.abs(y - yhat)
-    wape = safe_div(abs_err.sum(), np.abs(y).sum())
-    volume_bias = safe_div(yhat.sum() - y.sum(), np.abs(y).sum())
+    precision = safe_div(tp, tp + fp)
+    recall = safe_div(tp, tp + fn)
+    f1 = safe_div(2 * precision * recall, precision + recall) if not np.isnan(precision) and not np.isnan(recall) else np.nan
 
     return {
+        "month": df["month"].iloc[0],
         "rows": int(len(df)),
         "sku_count": int(df["unique_id"].nunique()),
-        "overall_acc": float(acc.mean()) if len(acc) else np.nan,
-        "pos_acc": float(acc[actual_pos].mean()) if actual_pos.any() else np.nan,
-        "zero_acc": float(acc[actual_zero].mean()) if actual_zero.any() else np.nan,
-        "wape": wape,
-        "business_accuracy": float(1 - wape) if not np.isnan(wape) else np.nan,
-        "volume_bias": volume_bias,
+        "business_accuracy": biz_acc,
+        "cls_accuracy": safe_div(tp + tn, tp + fp + tn + fn),
+        "f1_score": f1,
         "tp": tp,
         "fp": fp,
         "tn": tn,
         "fn": fn,
-        "cls_acc": safe_div(tp + tn, tp + fp + tn + fn),
-        "precision_pos": safe_div(tp, tp + fp),
-        "recall_pos": safe_div(tp, tp + fn),
-        "f1_pos": safe_div(2 * tp, 2 * tp + fp + fn),
-        "recall_zero": safe_div(tn, tn + fp),
-        "precision_zero": safe_div(tn, tn + fn),
     }
 
 
@@ -88,28 +80,13 @@ def maybe_filter_by_month(df: pd.DataFrame, month_start: Optional[str], month_en
     return out
 
 
-def threshold_sweep(df: pd.DataFrame, prob_col: str, reg_col: str, grid: List[float]) -> pd.DataFrame:
-    y = df["y"].to_numpy(dtype=float)
-    p = df[prob_col].to_numpy(dtype=float)
-    reg = df[reg_col].to_numpy(dtype=float)
-    rows = []
-    for t in grid:
-        yhat = np.where(p >= t, reg, 0.0)
-        tmp = df[["unique_id", "ds", "cutoff", "y"]].copy()
-        tmp["yhat"] = yhat
-        m = evaluate_slice(tmp, "yhat")
-        rows.append({"threshold": t, **m})
-    return pd.DataFrame(rows).sort_values("overall_acc", ascending=False)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="2-stage PatchTST 详细评估报告（含混淆矩阵/正样本准确率/整体准确率）。")
+    parser = argparse.ArgumentParser(description="按月份评估业务准确率 + 2stage分类指标。")
     parser.add_argument("--input", default="./forecast_results_patchtst_2stage.csv")
-    parser.add_argument("--pred-col", default=None)
+    parser.add_argument("--pred-col", default="yhat_two_stage")
     parser.add_argument("--month-start", default=None, help="YYYYMM，可选")
     parser.add_argument("--month-end", default=None, help="YYYYMM，可选")
-    parser.add_argument("--output-prefix", default="patchtst_2stage_eval")
-    parser.add_argument("--threshold-grid", default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9")
+    parser.add_argument("--output", default="./patchtst_2stage_monthly_eval.csv")
     args = parser.parse_args()
 
     df = pd.read_csv(args.input, parse_dates=["ds", "cutoff"])
@@ -120,60 +97,17 @@ def main():
     if df.empty:
         raise ValueError("筛选后数据为空，请检查 month_start/month_end。")
 
-    out_prefix = Path(args.output_prefix)
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
+    df["month"] = df["ds"].dt.strftime("%Y-%m")
+    monthly_rows = [evaluate_month(g, pred_col) for _, g in df.groupby("month", sort=True)]
+    monthly_df = pd.DataFrame(monthly_rows)
 
-    overall = pd.DataFrame([evaluate_slice(df, pred_col)])
-    overall.insert(0, "pred_col", pred_col)
-    overall.to_csv(f"{out_prefix}_overall.csv", index=False)
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    monthly_df.to_csv(out_path, index=False)
 
-    by_ds_rows = []
-    for ds, g in df.groupby("ds", sort=True):
-        row = evaluate_slice(g, pred_col)
-        row["ds"] = ds.strftime("%Y-%m-%d")
-        by_ds_rows.append(row)
-    by_ds = pd.DataFrame(by_ds_rows)
-    by_ds.to_csv(f"{out_prefix}_by_ds.csv", index=False)
-
-    by_cutoff_rows = []
-    for cutoff, g in df.groupby("cutoff", sort=True):
-        row = evaluate_slice(g, pred_col)
-        row["cutoff"] = cutoff.strftime("%Y-%m-%d")
-        by_cutoff_rows.append(row)
-    by_cutoff = pd.DataFrame(by_cutoff_rows)
-    by_cutoff.to_csv(f"{out_prefix}_by_cutoff.csv", index=False)
-
-    sku_rows = []
-    for uid, g in df.groupby("unique_id", sort=False):
-        row = evaluate_slice(g, pred_col)
-        row["unique_id"] = uid
-        sku_rows.append(row)
-    sku_diag = pd.DataFrame(sku_rows).sort_values("overall_acc")
-    sku_diag.to_csv(f"{out_prefix}_sku_diagnosis.csv", index=False)
-
-    conf = pd.DataFrame(
-        {
-            "": ["actual_zero", "actual_pos"],
-            "pred_zero": [int(overall["tn"].iloc[0]), int(overall["fn"].iloc[0])],
-            "pred_pos": [int(overall["fp"].iloc[0]), int(overall["tp"].iloc[0])],
-        }
-    )
-    conf.to_csv(f"{out_prefix}_confusion_overall.csv", index=False)
-
-    if {"p_nonzero", "yhat_reg_only"}.issubset(df.columns):
-        grid = [float(x.strip()) for x in args.threshold_grid.split(",") if x.strip()]
-        sweep = threshold_sweep(df, "p_nonzero", "yhat_reg_only", grid)
-        sweep.to_csv(f"{out_prefix}_threshold_sweep.csv", index=False)
-        print("best threshold by overall_acc:")
-        print(sweep.head(5)[["threshold", "overall_acc", "pos_acc", "zero_acc", "wape"]].to_string(index=False))
-
-    print("\n=== overall ===")
-    print(overall.to_string(index=False))
-    print(f"\nsaved: {out_prefix}_overall.csv")
-    print(f"saved: {out_prefix}_by_ds.csv")
-    print(f"saved: {out_prefix}_by_cutoff.csv")
-    print(f"saved: {out_prefix}_sku_diagnosis.csv")
-    print(f"saved: {out_prefix}_confusion_overall.csv")
+    print("\n=== monthly evaluation ===")
+    print(monthly_df.to_string(index=False))
+    print(f"\nsaved: {out_path}")
 
 
 if __name__ == "__main__":
