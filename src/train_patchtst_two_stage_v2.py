@@ -162,6 +162,27 @@ def main(args):
     df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).clip(lower=0.0)
     df = df[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"])
 
+    # Optional: filter out "hard" / out-of-scope series by series-level stats.
+    # This is series-level (per unique_id) filtering on the available history.
+    # Note: in cross-validation this uses the full series; if you want "as-of-cutoff"
+    # filtering, we'd need to compute stats per window/cutoff (more complex).
+    if not args.disable_series_filter:
+        max_y = df.groupby("unique_id")["y"].max()
+        zero_ratio = df["y"].eq(0).groupby(df["unique_id"]).mean()
+
+        keep_ids = max_y.index[
+            (max_y <= args.series_max_y) & (zero_ratio < args.series_max_zero_ratio)
+        ]
+        before_uids = df["unique_id"].nunique()
+        df = df[df["unique_id"].isin(keep_ids)].copy()
+        after_uids = df["unique_id"].nunique()
+        print(
+            f"series_filter: enabled max_y<={args.series_max_y} zero_ratio<{args.series_max_zero_ratio} "
+            f"kept_uids={after_uids}/{before_uids}"
+        )
+    else:
+        print("series_filter: disabled")
+
     min_len = args.input_size + args.horizon + (args.n_windows - 1) * args.step_size
     id_counts = df["unique_id"].value_counts()
     valid_ids = id_counts[id_counts >= min_len].index
@@ -218,6 +239,9 @@ def main(args):
                 "early_stop_patience_steps": args.early_stop_patience_steps,
                 "lr": args.lr,
                 "scaler_type": args.scaler_type,
+                "series_filter_disabled": bool(args.disable_series_filter),
+                "series_max_y": args.series_max_y,
+                "series_max_zero_ratio": args.series_max_zero_ratio,
             },
             allow_val_change=True,
         )
@@ -320,6 +344,24 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="./data/data_cleaned.csv")
     parser.add_argument("--cv-output", default="./forecast_results_patchtst_2stage_v2.csv")
     parser.add_argument("--metrics-output", default="./metrics_patchtst_2stage_v2.csv")
+
+    parser.add_argument(
+        "--disable-series-filter",
+        action="store_true",
+        help="关闭按 unique_id 的 series-level 过滤（默认开启：max_y<=series_max_y 且 zero_ratio<series_max_zero_ratio）。",
+    )
+    parser.add_argument(
+        "--series-max-y",
+        type=float,
+        default=100.0,
+        help="series-level 过滤：该 unique_id 的历史销量最大值必须 <= 该阈值。",
+    )
+    parser.add_argument(
+        "--series-max-zero-ratio",
+        type=float,
+        default=0.4,
+        help="series-level 过滤：该 unique_id 的历史销量 0 占比必须 < 该阈值。",
+    )
 
     parser.add_argument("--horizon", type=int, default=1)
     parser.add_argument("--input-size", type=int, default=24)
