@@ -81,6 +81,30 @@ def main(args):
     df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).clip(lower=0.0)
     df = df[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"])
 
+    # Train/validation split to avoid leakage:
+    # If you specify val_start/val_end (e.g. 2025-10-01 .. 2025-12-01), we:
+    # - only keep data <= val_end
+    # - use val_size = number of months in [val_start, val_end]
+    # NeuralForecast will train on all but the last val_size timestamps per series.
+    val_size = int(args.val_size)
+    train_end = None
+    val_start = None
+    val_end = None
+    if args.val_start or args.val_end:
+        if not (args.val_start and args.val_end):
+            raise ValueError("--val-start 和 --val-end 需要同时提供。")
+        val_start = pd.Timestamp(args.val_start)
+        val_end = pd.Timestamp(args.val_end)
+        if val_start.day != 1 or val_end.day != 1:
+            raise ValueError("val-start/val-end 请使用每月第一天（例如 2025-10-01）。")
+        if val_end < val_start:
+            raise ValueError("val-end 不能早于 val-start。")
+        # inclusive month count
+        val_size = (val_end.year - val_start.year) * 12 + (val_end.month - val_start.month) + 1
+        train_end = val_start - pd.offsets.MonthBegin(1)
+        # strictly restrict to <= val_end so that the last val_size months align to the validation window
+        df = df[df["ds"] <= val_end].copy()
+
     # series-level filtering (same semantics as train_patchtst_two_stage_v2.py)
     if not args.disable_series_filter:
         max_y = df.groupby("unique_id")["y"].max()
@@ -90,10 +114,22 @@ def main(args):
         ]
         df = df[df["unique_id"].isin(keep_ids)].copy()
 
-    # Ensure enough length for 1-step prediction after cutoff. (Training itself can use all history.)
+    # Ensure enough length for training + (optional) validation.
+    need_len = args.input_size + 1 + (val_size if val_size > 0 else 0)
     counts = df["unique_id"].value_counts()
-    keep_ids = counts[counts >= args.input_size + 1].index
+    keep_ids = counts[counts >= need_len].index
     df = df[df["unique_id"].isin(keep_ids)].copy()
+
+    # If val_start/val_end specified, make sure series actually reaches val_end,
+    # otherwise per-series "last val_size months" won't align.
+    if val_end is not None:
+        max_ds = df.groupby("unique_id")["ds"].max()
+        keep_ids = max_ds.index[max_ds >= val_end]
+        df = df[df["unique_id"].isin(keep_ids)].copy()
+
+    if args.early_stop_patience_steps >= 0 and val_size <= 0:
+        raise Exception("开启 early stopping 需要设置 val 集：请提供 --val-start/--val-end 或 --val-size>0")
+    es_patience = args.early_stop_patience_steps if val_size > 0 else -1
 
     out_dir = Path(args.save_dir)
     cls_dir = out_dir / "cls"
@@ -115,11 +151,14 @@ def main(args):
         loss=cls_loss,
         valid_loss=cls_loss,
         val_check_steps=args.val_check_steps,
-        early_stop_patience_steps=args.early_stop_patience_steps,
+        early_stop_patience_steps=es_patience,
         alias="cls",
     )
     nf_cls = NeuralForecast(models=[cls_model], freq="MS")
-    nf_cls.fit(df=cls_df)
+    if val_size > 0:
+        nf_cls.fit(df=cls_df, val_size=val_size)
+    else:
+        nf_cls.fit(df=cls_df)
     nf_cls.save(path=str(cls_dir), overwrite=True, save_dataset=False)
 
     # Stage-2 regressor: log1p(y)
@@ -137,11 +176,14 @@ def main(args):
         loss=reg_loss,
         valid_loss=reg_loss,
         val_check_steps=args.val_check_steps,
-        early_stop_patience_steps=args.early_stop_patience_steps,
+        early_stop_patience_steps=es_patience,
         alias="reg",
     )
     nf_reg = NeuralForecast(models=[reg_model], freq="MS")
-    nf_reg.fit(df=reg_df)
+    if val_size > 0:
+        nf_reg.fit(df=reg_df, val_size=val_size)
+    else:
+        nf_reg.fit(df=reg_df)
     nf_reg.save(path=str(reg_dir), overwrite=True, save_dataset=False)
 
     params = {
@@ -154,22 +196,33 @@ def main(args):
         "platt_a": None,
         "platt_b": None,
         "prob_col": "p_nonzero_cal" if args.use_calibrated_prob else "p_nonzero",
+        "val_size": int(val_size),
+        "val_start": str(val_start.date()) if val_start is not None else None,
+        "val_end": str(val_end.date()) if val_end is not None else None,
+        "train_end": str(train_end.date()) if train_end is not None else None,
     }
 
     # Optional: calibrate (Platt) + select threshold on a holdout "tail" slice.
     if args.calibrate:
-        # Use the last N months per series as calibration targets (and only use history before them).
-        tail_n = int(args.calib_tail_months)
         grid = parse_threshold_grid(args.threshold_grid)
 
-        # Build a simple cutoff-based calibration set: for each uid, pick the last tail_n months.
-        # For month t, cutoff is t-1 month.
+        # If val_start/val_end given, calibrate on that validation window only (recommended).
+        # Otherwise fallback to the last N months per series.
         cal_targets = []
-        for uid, g in df.groupby("unique_id", sort=False):
-            g = g.sort_values("ds")
-            if len(g) <= args.input_size + tail_n:
-                continue
-            cal_targets.append(g.tail(tail_n)[["unique_id", "ds", "y"]])
+        if val_start is not None and val_end is not None:
+            cal = df[(df["ds"] >= val_start) & (df["ds"] <= val_end)][["unique_id", "ds", "y"]].copy()
+            if cal.empty:
+                raise ValueError("calibrate 失败：指定的 val_start/val_end 区间没有数据。")
+            cal_targets = [cal]
+            params["calib_mode"] = "val_window"
+        else:
+            tail_n = int(args.calib_tail_months)
+            for uid, g in df.groupby("unique_id", sort=False):
+                g = g.sort_values("ds")
+                if len(g) <= args.input_size + tail_n:
+                    continue
+                cal_targets.append(g.tail(tail_n)[["unique_id", "ds", "y"]])
+            params["calib_mode"] = "tail"
         if not cal_targets:
             raise ValueError("calibrate 失败：没有足够长的序列生成校准集。")
         cal_targets = pd.concat(cal_targets, ignore_index=True)
@@ -222,7 +275,8 @@ def main(args):
         params["platt_b"] = float(b)
         params["selected_threshold"] = float(best_t)
         params["calib_mean_acc"] = float(best)
-        params["calib_tail_months"] = int(tail_n)
+        if params.get("calib_mode") == "tail":
+            params["calib_tail_months"] = int(tail_n)
 
         print(f"calibrate: platt=(a={a:.4f}, b={b:.4f}) best_t={best_t:.3f} mean_acc={best:.5f}")
 
@@ -246,6 +300,17 @@ if __name__ == "__main__":
     p.add_argument("--reg-max-steps", type=int, default=5000)
     p.add_argument("--val-check-steps", type=int, default=200)
     p.add_argument("--early-stop-patience-steps", type=int, default=10)
+    p.add_argument("--val-size", type=int, default=0, help="验证集长度（每个序列末尾保留的时间步数）。")
+    p.add_argument(
+        "--val-start",
+        default="",
+        help="验证集开始月份（例如 2025-10-01）。提供后会自动计算 val_size 并截断 df<=val_end，避免数据泄漏。",
+    )
+    p.add_argument(
+        "--val-end",
+        default="",
+        help="验证集结束月份（例如 2025-12-01）。",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--scaler-type", default="robust", choices=["identity", "standard", "robust"])
 
@@ -272,4 +337,3 @@ if __name__ == "__main__":
     )
 
     main(p.parse_args())
-
