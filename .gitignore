@@ -5,6 +5,8 @@ __pycache__/
 .pycache/
 lightning_logs/
 analysis/
+checkpoints/
+wandb/
 
 # generated outputs
 data/data_cleaned.csv
