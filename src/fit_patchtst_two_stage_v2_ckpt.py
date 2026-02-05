@@ -57,6 +57,7 @@ def fit_platt_scaling(
 
 
 def acc_vectorized(f: np.ndarray, a: np.ndarray):
+    """Business accuracy (strictly following your definition)."""
     out = np.zeros_like(f, dtype=float)
     both_zero = (f == 0) & (a == 0)
     bad = (f != 0) & (a == 0)
@@ -75,69 +76,125 @@ def parse_threshold_grid(s: str):
     return sorted(set(vals))
 
 
+def classification_stats(pred: np.ndarray, actual: np.ndarray):
+    pred_pos = pred > 0
+    actual_pos = actual > 0
+    tp = int((pred_pos & actual_pos).sum())
+    fp = int((pred_pos & ~actual_pos).sum())
+    tn = int((~pred_pos & ~actual_pos).sum())
+    fn = int((~pred_pos & actual_pos).sum())
+    acc = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) else np.nan
+    precision = tp / (tp + fp) if (tp + fp) else np.nan
+    recall = tp / (tp + fn) if (tp + fn) else np.nan
+    f1 = (
+        (2 * precision * recall / (precision + recall))
+        if (precision == precision and recall == recall and (precision + recall))
+        else np.nan
+    )
+    return {
+        "cls_accuracy": float(acc) if acc == acc else np.nan,
+        "f1_score": float(f1) if f1 == f1 else np.nan,
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    }
+
+
+def _require_month_start(ts: pd.Timestamp, name: str):
+    if ts.day != 1:
+        raise ValueError(f"{name} 请使用每月第一天（例如 2025-09-01）。")
+
+
+def build_hist(df_all: pd.DataFrame, ids: np.ndarray, cutoff: pd.Timestamp, input_size: int):
+    """Return history <= cutoff for given ids, requiring ds==cutoff present and len>=input_size."""
+    hist = df_all[(df_all["unique_id"].isin(ids)) & (df_all["ds"] <= cutoff)].copy()
+    if hist.empty:
+        return hist
+    # must have observation at cutoff, otherwise predict date won't align to target month
+    has_cutoff = hist.loc[hist["ds"] == cutoff, "unique_id"].unique()
+    hist = hist[hist["unique_id"].isin(has_cutoff)].copy()
+    if hist.empty:
+        return hist
+    counts = hist["unique_id"].value_counts()
+    ok = counts[counts >= input_size].index
+    return hist[hist["unique_id"].isin(ok)].copy()
+
+
+def predict_val_window(
+    *,
+    df_all: pd.DataFrame,
+    nf_cls: NeuralForecast,
+    nf_reg: NeuralForecast,
+    val_start: pd.Timestamp,
+    val_end: pd.Timestamp,
+    input_size: int,
+):
+    """Rolling 1-step forecasts for each month in [val_start, val_end]."""
+    rows = []
+    cutoffs = pd.date_range(val_start - pd.offsets.MonthBegin(1), val_end - pd.offsets.MonthBegin(1), freq="MS")
+    for cutoff in cutoffs:
+        target_ds = cutoff + pd.offsets.MonthBegin(1)
+        tg = df_all[df_all["ds"] == target_ds][["unique_id", "y"]].copy()
+        if tg.empty:
+            continue
+        hist = build_hist(df_all, tg["unique_id"].unique(), cutoff, input_size)
+        if hist.empty:
+            continue
+
+        hist_cls = hist.copy()
+        hist_cls["y"] = (hist_cls["y"] > 0).astype(float)
+        hist_reg = hist.copy()
+        hist_reg["y"] = np.log1p(hist_reg["y"])
+
+        p1 = nf_cls.predict(df=hist_cls).rename(columns={"cls": "score_nonzero"})
+        p2 = nf_reg.predict(df=hist_reg).rename(columns={"reg": "yhat_log"})
+        m = p1.merge(p2, on=["unique_id", "ds"], how="inner")
+        m["cutoff"] = pd.Timestamp(cutoff)
+
+        # only keep target month
+        m = m[m["ds"] == target_ds].copy()
+        if m.empty:
+            continue
+        m = m.merge(tg, on="unique_id", how="left")
+        rows.append(m)
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True).sort_values(["cutoff", "unique_id"]).reset_index(drop=True)
+    return out
+
+
 def main(args):
-    df = pd.read_csv(args.data)
-    df["ds"] = pd.to_datetime(df["ds"])
-    df["y"] = pd.to_numeric(df["y"], errors="coerce").fillna(0.0).clip(lower=0.0)
-    df = df[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"])
+    df_all = pd.read_csv(args.data)
+    df_all["ds"] = pd.to_datetime(df_all["ds"])
+    df_all["y"] = pd.to_numeric(df_all["y"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    df_all = df_all[["unique_id", "ds", "y"]].sort_values(["unique_id", "ds"])
 
-    # Train/validation split to avoid leakage:
-    # If you specify val_start/val_end (e.g. 2025-10-01 .. 2025-12-01), we:
-    # - only keep data <= val_end
-    # - use val_size = number of months in [val_start, val_end]
-    # NeuralForecast will train on all but the last val_size timestamps per series.
-    val_size = int(args.val_size)
-    train_end = None
-    val_start = None
-    val_end = None
-    if args.val_start or args.val_end:
-        if not (args.val_start and args.val_end):
-            raise ValueError("--val-start 和 --val-end 需要同时提供。")
-        val_start = pd.Timestamp(args.val_start)
-        val_end = pd.Timestamp(args.val_end)
-        if val_start.day != 1 or val_end.day != 1:
-            raise ValueError("val-start/val-end 请使用每月第一天（例如 2025-10-01）。")
-        if val_end < val_start:
-            raise ValueError("val-end 不能早于 val-start。")
-        # inclusive month count
-        val_size = (val_end.year - val_start.year) * 12 + (val_end.month - val_start.month) + 1
-        train_end = val_start - pd.offsets.MonthBegin(1)
-        # strictly restrict to <= val_end so that the last val_size months align to the validation window
-        df = df[df["ds"] <= val_end].copy()
+    train_end = pd.Timestamp(args.train_end)
+    val_start = pd.Timestamp(args.val_start)
+    val_end = pd.Timestamp(args.val_end) if args.val_end else df_all["ds"].max()
+    _require_month_start(train_end, "train-end")
+    _require_month_start(val_start, "val-start")
+    _require_month_start(val_end, "val-end")
+    if val_end < val_start:
+        raise ValueError("val-end 不能早于 val-start。")
+    if val_start <= train_end:
+        raise ValueError("val-start 必须晚于 train-end（例如 train_end=2025-09-01, val_start=2025-10-01）。")
 
-    # series-level filtering (same semantics as train_patchtst_two_stage_v2.py)
-    if not args.disable_series_filter:
-        max_y = df.groupby("unique_id")["y"].max()
-        zero_ratio = df["y"].eq(0).groupby(df["unique_id"]).mean()
-        keep_ids = max_y.index[
-            (max_y <= args.series_max_y) & (zero_ratio < args.series_max_zero_ratio)
-        ]
-        df = df[df["unique_id"].isin(keep_ids)].copy()
-
-    # Ensure enough length for training + (optional) validation.
-    need_len = args.input_size + 1 + (val_size if val_size > 0 else 0)
-    counts = df["unique_id"].value_counts()
-    keep_ids = counts[counts >= need_len].index
-    df = df[df["unique_id"].isin(keep_ids)].copy()
-
-    # If val_start/val_end specified, make sure series actually reaches val_end,
-    # otherwise per-series "last val_size months" won't align.
-    if val_end is not None:
-        max_ds = df.groupby("unique_id")["ds"].max()
-        keep_ids = max_ds.index[max_ds >= val_end]
-        df = df[df["unique_id"].isin(keep_ids)].copy()
-
-    if args.early_stop_patience_steps >= 0 and val_size <= 0:
-        raise Exception("开启 early stopping 需要设置 val 集：请提供 --val-start/--val-end 或 --val-size>0")
-    es_patience = args.early_stop_patience_steps if val_size > 0 else -1
+    # Avoid leakage: keep only <= val_end; train strictly on <= train_end.
+    df_all = df_all[df_all["ds"] <= val_end].copy()
+    df_train = df_all[df_all["ds"] <= train_end].copy()
+    if df_train.empty:
+        raise ValueError("训练集为空：请检查 train-end 是否在数据范围内。")
 
     out_dir = Path(args.save_dir)
     cls_dir = out_dir / "cls"
     reg_dir = out_dir / "reg"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Stage-1 classifier: y in {0,1}
-    cls_df = df.copy()
+    # Stage-1 classifier (score-regression to {0,1}; no early stopping).
+    cls_df = df_train.copy()
     cls_df["y"] = (cls_df["y"] > 0).astype(float)
     cls_loss = build_loss(args.cls_loss, args.cls_huber_delta)
     cls_model = PatchTST(
@@ -151,18 +208,15 @@ def main(args):
         loss=cls_loss,
         valid_loss=cls_loss,
         val_check_steps=args.val_check_steps,
-        early_stop_patience_steps=es_patience,
+        early_stop_patience_steps=-1,  # disable
         alias="cls",
     )
     nf_cls = NeuralForecast(models=[cls_model], freq="MS")
-    if val_size > 0:
-        nf_cls.fit(df=cls_df, val_size=val_size)
-    else:
-        nf_cls.fit(df=cls_df)
+    nf_cls.fit(df=cls_df)
     nf_cls.save(path=str(cls_dir), overwrite=True, save_dataset=False)
 
-    # Stage-2 regressor: log1p(y)
-    reg_df = df.copy()
+    # Stage-2 regressor (log1p; no early stopping).
+    reg_df = df_train.copy()
     reg_df["y"] = np.log1p(reg_df["y"])
     reg_loss = build_loss(args.reg_loss, args.huber_delta)
     reg_model = PatchTST(
@@ -176,121 +230,152 @@ def main(args):
         loss=reg_loss,
         valid_loss=reg_loss,
         val_check_steps=args.val_check_steps,
-        early_stop_patience_steps=es_patience,
+        early_stop_patience_steps=-1,  # disable
         alias="reg",
     )
     nf_reg = NeuralForecast(models=[reg_model], freq="MS")
-    if val_size > 0:
-        nf_reg.fit(df=reg_df, val_size=val_size)
-    else:
-        nf_reg.fit(df=reg_df)
+    nf_reg.fit(df=reg_df)
     nf_reg.save(path=str(reg_dir), overwrite=True, save_dataset=False)
 
-    params = {
-        "input_size": args.input_size,
-        "patch_len": args.patch_len,
-        "stride": args.stride,
-        "scaler_type": args.scaler_type,
-        "use_calibrated_prob": bool(args.use_calibrated_prob),
-        "selected_threshold": float(args.selected_threshold) if args.selected_threshold >= 0 else None,
-        "platt_a": None,
-        "platt_b": None,
-        "prob_col": "p_nonzero_cal" if args.use_calibrated_prob else "p_nonzero",
-        "val_size": int(val_size),
-        "val_start": str(val_start.date()) if val_start is not None else None,
-        "val_end": str(val_end.date()) if val_end is not None else None,
-        "train_end": str(train_end.date()) if train_end is not None else None,
-    }
+    # Validation rolling predictions (always saved).
+    val_base = predict_val_window(
+        df_all=df_all,
+        nf_cls=nf_cls,
+        nf_reg=nf_reg,
+        val_start=val_start,
+        val_end=val_end,
+        input_size=args.input_size,
+    )
+    if val_base.empty:
+        raise ValueError("验证集窗口没有产生任何预测：请检查 input_size 或数据是否覆盖 cutoff 月份。")
 
-    # Optional: calibrate (Platt) + select threshold on a holdout "tail" slice.
+    # Probabilities (raw and optional calibrated)
+    logits = val_base["score_nonzero"].to_numpy(dtype=float)
+    p_raw = np.clip(logits, 0.0, 1.0)
+    val_base["p_nonzero"] = p_raw
+
+    platt_a = None
+    platt_b = None
     if args.calibrate:
-        grid = parse_threshold_grid(args.threshold_grid)
+        y_cls = (val_base["y"].to_numpy(dtype=float) > 0).astype(float)
+        platt_a, platt_b = fit_platt_scaling(
+            logits, y_cls, max_iter=args.calib_max_iter, sample=args.calib_sample
+        )
+        print(f"platt: a={platt_a:.4f} b={platt_b:.4f}")
 
-        # If val_start/val_end given, calibrate on that validation window only (recommended).
-        # Otherwise fallback to the last N months per series.
-        cal_targets = []
-        if val_start is not None and val_end is not None:
-            cal = df[(df["ds"] >= val_start) & (df["ds"] <= val_end)][["unique_id", "ds", "y"]].copy()
-            if cal.empty:
-                raise ValueError("calibrate 失败：指定的 val_start/val_end 区间没有数据。")
-            cal_targets = [cal]
-            params["calib_mode"] = "val_window"
-        else:
-            tail_n = int(args.calib_tail_months)
-            for uid, g in df.groupby("unique_id", sort=False):
-                g = g.sort_values("ds")
-                if len(g) <= args.input_size + tail_n:
-                    continue
-                cal_targets.append(g.tail(tail_n)[["unique_id", "ds", "y"]])
-            params["calib_mode"] = "tail"
-        if not cal_targets:
-            raise ValueError("calibrate 失败：没有足够长的序列生成校准集。")
-        cal_targets = pd.concat(cal_targets, ignore_index=True)
-        cal_targets["cutoff"] = cal_targets["ds"] - pd.offsets.MonthBegin(1)
+    if args.use_calibrated_prob:
+        if platt_a is None or platt_b is None:
+            raise ValueError("use-calibrated-prob 需要 --calibrate 以得到 platt 参数。")
+        p_used = sigmoid(platt_a * logits + platt_b)
+    else:
+        p_used = p_raw
+    val_base["p_nonzero_cal"] = p_used
 
-        # Run prediction grouped by cutoff (so each prediction uses <= cutoff history).
-        preds = []
-        for cutoff, tg in cal_targets.groupby("cutoff", sort=True):
-            ids = tg["unique_id"].unique().tolist()
-            hist = df[(df["unique_id"].isin(ids)) & (df["ds"] <= cutoff)].copy()
-            # Require at least input_size points
-            c = hist["unique_id"].value_counts()
-            ok = c[c >= args.input_size].index
-            hist = hist[hist["unique_id"].isin(ok)].copy()
-            if hist.empty:
-                continue
-            p1 = nf_cls.predict(df=hist).rename(columns={"cls": "score_nonzero"})
-            p2 = nf_reg.predict(df=hist).rename(columns={"reg": "yhat_log"})
-            p1["cutoff"] = pd.Timestamp(cutoff)
-            p2["cutoff"] = pd.Timestamp(cutoff)
-            preds.append(
-                p1.merge(p2, on=["unique_id", "ds"], how="inner").merge(
-                    tg, on=["unique_id", "ds"], how="inner"
-                )
-            )
-        if not preds:
-            raise ValueError("calibrate 失败：无法产生任何预测用于校准。")
-        cal = pd.concat(preds, ignore_index=True)
+    # Regression to original scale
+    val_base["yhat_reg_only"] = np.expm1(val_base["yhat_log"]).clip(lower=0.0)
 
-        logits = cal["score_nonzero"].to_numpy(dtype=float)
-        y_cls = (cal["y"].to_numpy(dtype=float) > 0).astype(float)
-        a, b = fit_platt_scaling(logits, y_cls, max_iter=args.calib_max_iter, sample=args.calib_sample)
-        p_raw = np.clip(logits, 0.0, 1.0)
-        p_cal = sigmoid(a * logits + b)
-
-        reg = np.expm1(cal["yhat_log"].to_numpy(dtype=float)).clip(min=0.0)
-        y = cal["y"].to_numpy(dtype=float)
-
+    # Select threshold on validation window if not provided.
+    grid = parse_threshold_grid(args.threshold_grid)
+    threshold = float(args.selected_threshold) if args.selected_threshold >= 0 else None
+    if threshold is None and args.select_threshold_on_val:
+        reg = val_base["yhat_reg_only"].to_numpy(dtype=float)
+        y = val_base["y"].to_numpy(dtype=float)
         best_t = None
         best = -1.0
-        p_used = p_cal if args.use_calibrated_prob else p_raw
         for t in grid:
             yhat = np.where(p_used >= t, reg, 0.0)
             score = float(acc_vectorized(yhat, y).mean())
             if score > best:
                 best = score
                 best_t = float(t)
+        threshold = best_t
+        print(f"threshold_on_val: best_t={threshold:.3f} mean_acc={best:.6f}")
+    if threshold is None:
+        threshold = float(args.threshold_fallback)
 
-        params["platt_a"] = float(a)
-        params["platt_b"] = float(b)
-        params["selected_threshold"] = float(best_t)
-        params["calib_mean_acc"] = float(best)
-        if params.get("calib_mode") == "tail":
-            params["calib_tail_months"] = int(tail_n)
+    val_base["selected_threshold"] = threshold
+    val_base["yhat_two_stage"] = np.where(
+        val_base["p_nonzero_cal"].to_numpy(dtype=float) >= threshold,
+        val_base["yhat_reg_only"].to_numpy(dtype=float),
+        0.0,
+    ).astype(float)
 
-        print(f"calibrate: platt=(a={a:.4f}, b={b:.4f}) best_t={best_t:.3f} mean_acc={best:.5f}")
+    # Metrics (overall + by month)
+    y = val_base["y"].to_numpy(dtype=float)
+    yhat = val_base["yhat_two_stage"].to_numpy(dtype=float)
+    overall_ba = float(acc_vectorized(yhat, y).mean())
+    overall = {
+        "rows": int(len(val_base)),
+        "business_accuracy": overall_ba,
+        "count_actual_zero": int((y == 0).sum()),
+        "count_pred_zero": int((yhat == 0).sum()),
+        **classification_stats(yhat, y),
+    }
 
-    params_path = out_dir / "params.json"
-    params_path.write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+    def _month_metrics(g: pd.DataFrame):
+        yy = g["y"].to_numpy(dtype=float)
+        yh = g["yhat_two_stage"].to_numpy(dtype=float)
+        m = {
+            "rows": int(len(g)),
+            "business_accuracy": float(acc_vectorized(yh, yy).mean()),
+            "count_actual_zero": int((yy == 0).sum()),
+            "count_pred_zero": int((yh == 0).sum()),
+        }
+        m.update(classification_stats(yh, yy))
+        return pd.Series(m)
+
+    by_month = (
+        val_base.assign(month=val_base["ds"].dt.strftime("%Y%m"))
+        .groupby("month", as_index=False)
+        .apply(_month_metrics)
+        .reset_index(drop=True)
+    )
+
+    Path(args.val_preds_output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.val_metrics_output).parent.mkdir(parents=True, exist_ok=True)
+    val_base.to_csv(args.val_preds_output, index=False)
+    by_month.to_csv(args.val_metrics_output, index=False)
+
+    params = {
+        "train_end": str(train_end.date()),
+        "val_start": str(val_start.date()),
+        "val_end": str(val_end.date()),
+        "input_size": int(args.input_size),
+        "patch_len": int(args.patch_len),
+        "stride": int(args.stride),
+        "scaler_type": args.scaler_type,
+        "use_calibrated_prob": bool(args.use_calibrated_prob),
+        "platt_a": platt_a,
+        "platt_b": platt_b,
+        "selected_threshold": threshold,
+        "val_overall": overall,
+    }
+
+    (out_dir / "params.json").write_text(
+        json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     print(f"saved cls ckpt: {cls_dir}")
     print(f"saved reg ckpt: {reg_dir}")
-    print(f"saved params:   {params_path}")
+    print(f"saved params:   {out_dir / 'params.json'}")
+    print(f"saved val preds: {args.val_preds_output}")
+    print(f"saved val metrics: {args.val_metrics_output}")
+    print(f"val overall business_accuracy={overall_ba:.6f} rows={overall['rows']}")
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="训练 two-stage PatchTST v2 并保存 checkpoint（cls + reg + params）。")
+    p = argparse.ArgumentParser(
+        description="训练 two-stage PatchTST v2 并保存 checkpoint（cls + reg + params），并对验证窗口输出预测与业务准确率。"
+    )
     p.add_argument("--data", default="./data/data_cleaned.csv")
     p.add_argument("--save-dir", default="./checkpoints/patchtst_2stage_v2")
+
+    # Per request: fixed split to avoid leakage
+    p.add_argument("--train-end", default="2025-09-01")
+    p.add_argument("--val-start", default="2025-10-01")
+    p.add_argument("--val-end", default="", help="可空，默认用数据最大月份（每月第一天）。")
+    p.add_argument("--val-preds-output", default="./analysis/val_preds_two_stage_v2.csv")
+    p.add_argument("--val-metrics-output", default="./analysis/val_metrics_two_stage_v2.csv")
 
     p.add_argument("--input-size", type=int, default=24)
     p.add_argument("--patch-len", type=int, default=4)
@@ -299,41 +384,36 @@ if __name__ == "__main__":
     p.add_argument("--cls-max-steps", type=int, default=5000)
     p.add_argument("--reg-max-steps", type=int, default=5000)
     p.add_argument("--val-check-steps", type=int, default=200)
-    p.add_argument("--early-stop-patience-steps", type=int, default=10)
-    p.add_argument("--val-size", type=int, default=0, help="验证集长度（每个序列末尾保留的时间步数）。")
-    p.add_argument(
-        "--val-start",
-        default="",
-        help="验证集开始月份（例如 2025-10-01）。提供后会自动计算 val_size 并截断 df<=val_end，避免数据泄漏。",
-    )
-    p.add_argument(
-        "--val-end",
-        default="",
-        help="验证集结束月份（例如 2025-12-01）。",
-    )
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--scaler-type", default="robust", choices=["identity", "standard", "robust"])
+    p.add_argument(
+        "--scaler-type", default="robust", choices=["identity", "standard", "robust"]
+    )
 
     p.add_argument("--cls-loss", choices=["mse", "mae", "huber"], default="mse")
     p.add_argument("--cls-huber-delta", type=float, default=1.0)
     p.add_argument("--reg-loss", choices=["mse", "mae", "huber"], default="huber")
     p.add_argument("--huber-delta", type=float, default=5.0)
 
-    # Same filter semantics as training script
-    p.add_argument("--disable-series-filter", action="store_true")
-    p.add_argument("--series-max-y", type=float, default=100.0)
-    p.add_argument("--series-max-zero-ratio", type=float, default=0.4)
+    # Thresholding
+    p.add_argument(
+        "--selected-threshold",
+        type=float,
+        default=-1.0,
+        help="手动指定门控阈值；<0 则（若 select-threshold-on-val）在验证集上选。",
+    )
+    p.add_argument("--threshold-fallback", type=float, default=0.5)
+    p.add_argument("--select-threshold-on-val", action="store_true", help="在验证窗口上选单一阈值。")
 
-    # threshold & calibration
-    p.add_argument("--selected-threshold", type=float, default=-1.0, help="手动指定门控阈值；<0 则（若 calibrate）自动选择。")
+    # Optional calibration
     p.add_argument("--use-calibrated-prob", action="store_true")
-    p.add_argument("--calibrate", action="store_true", help="在训练后做一次 tail 校准：Platt + 阈值选择。")
-    p.add_argument("--calib-tail-months", type=int, default=6)
+    p.add_argument("--calibrate", action="store_true", help="在验证窗口上做 Platt 校准（不会泄漏到训练）。")
     p.add_argument("--calib-max-iter", type=int, default=30)
     p.add_argument("--calib-sample", type=int, default=200_000)
+
     p.add_argument(
         "--threshold-grid",
         default="0.05,0.1,0.15,0.2,0.25,0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9,0.95",
     )
 
     main(p.parse_args())
+
