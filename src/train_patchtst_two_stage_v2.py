@@ -17,6 +17,19 @@ def build_reg_loss(loss_name: str, huber_delta: float):
         return HuberLoss(delta=huber_delta)
     return MSE()
 
+def build_cls_loss(loss_name: str, huber_delta: float):
+    """NeuralForecast-native loss for classification stage.
+
+    PatchTST in this NeuralForecast version doesn't support a native BCE loss,
+    so we model classification as score-regression to {0,1} and then calibrate.
+    """
+    name = loss_name.lower()
+    if name == "mae":
+        return MAE()
+    if name == "huber":
+        return HuberLoss(delta=huber_delta)
+    return MSE()
+
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
@@ -114,6 +127,14 @@ def parse_threshold_grid(s: str):
 
 
 def run_cv_patchtst(df: pd.DataFrame, args, loss):
+    trainer_kwargs = {}
+    if args.wandb_project:
+        trainer_kwargs["logger"] = args._wandb_logger  # set at runtime
+        trainer_kwargs["callbacks"] = args._trainer_callbacks  # set at runtime
+        trainer_kwargs["log_every_n_steps"] = args.log_every_n_steps
+        trainer_kwargs["enable_checkpointing"] = False
+        trainer_kwargs["enable_model_summary"] = False
+
     model = PatchTST(
         h=args.horizon,
         input_size=args.input_size,
@@ -125,6 +146,9 @@ def run_cv_patchtst(df: pd.DataFrame, args, loss):
         loss=loss,
         valid_loss=loss,
         val_check_steps=args.val_check_steps,
+        # Enable early stopping when >= 0; NF default (-1) disables.
+        early_stop_patience_steps=args.early_stop_patience_steps,
+        **trainer_kwargs,
     )
     nf = NeuralForecast(models=[model], freq="MS")
     return nf.cross_validation(df=df, n_windows=args.n_windows, step_size=args.step_size)
@@ -145,37 +169,87 @@ def main(args):
     print(f"rows={len(df)} uids={df['unique_id'].nunique()} min_len={min_len} zero_ratio={(df['y']==0).mean():.4f}")
     print(f"PatchTST tokens={tokens} (L={args.input_size}, patch_len={args.patch_len}, stride={args.stride})")
 
-    # Stage-1 (classification): logits trained with BCEWithLogitsLoss.
+    # W&B logging (optional): a single run, log grad_norm for cls/reg with different keys.
+    if args.wandb_project:
+        try:
+            from lightning.pytorch.callbacks import Callback
+            from lightning.pytorch.loggers import WandbLogger
+        except Exception:
+            from pytorch_lightning.callbacks import Callback
+            from pytorch_lightning.loggers import WandbLogger
+        import wandb
+
+        class GradNormLogger(Callback):
+            def __init__(self, key_prefix: str):
+                super().__init__()
+                self.key_prefix = key_prefix
+
+            def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+                total = 0.0
+                for p in pl_module.parameters():
+                    if p.grad is None:
+                        continue
+                    param_norm = p.grad.detach().data.norm(2).item()
+                    total += param_norm * param_norm
+                grad_norm = total**0.5
+                pl_module.log(f"{self.key_prefix}/grad_norm", grad_norm, on_step=True, logger=True, prog_bar=False)
+
+        # Initialize run once; reuse logger for both trainers.
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_run_name,
+            tags=tags or None,
+            save_dir=args.wandb_dir,
+        )
+        wandb_logger.experiment.config.update(
+            {
+                "horizon": args.horizon,
+                "input_size": args.input_size,
+                "patch_len": args.patch_len,
+                "stride": args.stride,
+                "n_windows": args.n_windows,
+                "step_size": args.step_size,
+                "max_steps": args.max_steps,
+                "val_check_steps": args.val_check_steps,
+                "early_stop_patience_steps": args.early_stop_patience_steps,
+                "lr": args.lr,
+                "scaler_type": args.scaler_type,
+            },
+            allow_val_change=True,
+        )
+    else:
+        wandb_logger = None
+
+    # Stage-1 (classification): score-regression to {0,1} with NF-native losses,
+    # then probability calibration (Platt scaling) on that score.
     cls_df = df.copy()
     cls_df["y"] = (cls_df["y"] > 0).astype(float)
-    if args.pos_weight == "auto":
-        pos = float(cls_df["y"].sum())
-        neg = float(len(cls_df) - pos)
-        pw = (neg / pos) if pos > 0 else 1.0
-        pw = float(min(max(pw, 1.0), args.pos_weight_cap))
-    else:
-        pw = float(args.pos_weight)
-    cls_loss = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pw], dtype=torch.float32))
-    cls_cv = run_cv_patchtst(cls_df, args, loss=cls_loss).rename(columns={"y": "y_cls", "PatchTST": "logit_nonzero"})
+    cls_loss = build_cls_loss(args.cls_loss, args.cls_huber_delta)
+    args._wandb_logger = wandb_logger
+    args._trainer_callbacks = [GradNormLogger("cls")] if wandb_logger else None
+    cls_cv = run_cv_patchtst(cls_df, args, loss=cls_loss).rename(columns={"y": "y_cls", "PatchTST": "score_nonzero"})
 
-    # Convert logits -> prob, then Platt scaling calibration.
-    logits = cls_cv["logit_nonzero"].to_numpy(dtype=float)
+    # Convert score -> raw prob (clipped), then Platt scaling calibration.
+    logits = cls_cv["score_nonzero"].to_numpy(dtype=float)
     y_cls = cls_cv["y_cls"].to_numpy(dtype=float)
     a, b = fit_platt_scaling(logits, y_cls, max_iter=args.calib_max_iter, sample=args.calib_sample)
-    cls_cv["p_nonzero"] = sigmoid(logits)
+    cls_cv["p_nonzero"] = np.clip(logits, 0.0, 1.0)
     cls_cv["p_nonzero_cal"] = sigmoid(a * logits + b)
     cls_cv["platt_a"] = a
     cls_cv["platt_b"] = b
-    print(f"classifier pos_weight={pw:.3f} platt=(a={a:.4f}, b={b:.4f})")
+    print(f"classifier loss={args.cls_loss} platt=(a={a:.4f}, b={b:.4f})")
 
     # Stage-2 (regression): log1p(y) + robust loss.
     reg_df = df.copy()
     reg_df["y"] = np.log1p(reg_df["y"])
     reg_loss = build_reg_loss(args.reg_loss, args.huber_delta)
+    args._trainer_callbacks = [GradNormLogger("reg")] if wandb_logger else None
     reg_cv = run_cv_patchtst(reg_df, args, loss=reg_loss).rename(columns={"y": "y_log", "PatchTST": "yhat_log"})
 
     key_cols = ["unique_id", "ds", "cutoff"]
-    out = cls_cv[key_cols + ["y_cls", "logit_nonzero", "p_nonzero", "p_nonzero_cal", "platt_a", "platt_b"]].merge(
+    out = cls_cv[key_cols + ["y_cls", "score_nonzero", "p_nonzero", "p_nonzero_cal", "platt_a", "platt_b"]].merge(
         reg_cv[key_cols + ["yhat_log"]],
         on=key_cols,
         how="inner",
@@ -223,9 +297,24 @@ def main(args):
     print(f"\nsaved cv: {out_cv}")
     print(f"saved metrics: {out_metrics}")
 
+    if wandb_logger is not None:
+        # Log summary metrics (business accuracy is based on your acc formula).
+        mean_acc = float(metrics_df.loc[metrics_df["model"] == "TwoStage", "MeanAccuracy"].iloc[0])
+        first_acc = float(metrics_df.loc[metrics_df["model"] == "TwoStage", "FirstMonthAccuracy"].iloc[0])
+        wandb_logger.experiment.log(
+            {
+                "eval/selected_threshold": best_t,
+                "eval/mean_accuracy": mean_acc,
+                "eval/first_month_accuracy": first_acc,
+                "eval/platt_a": a,
+                "eval/platt_b": b,
+            }
+        )
+        wandb.finish()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PatchTST 两阶段 v2：BCE分类(logits)+Platt校准 + log1p回归。")
+    parser = argparse.ArgumentParser(description="PatchTST 两阶段 v2：NF-native分类loss + Platt校准 + log1p回归。")
     parser.add_argument("--data", default="./data/data_cleaned.csv")
     parser.add_argument("--cv-output", default="./forecast_results_patchtst_2stage_v2.csv")
     parser.add_argument("--metrics-output", default="./metrics_patchtst_2stage_v2.csv")
@@ -239,18 +328,31 @@ if __name__ == "__main__":
 
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--val-check-steps", type=int, default=100)
+    parser.add_argument(
+        "--early-stop-patience-steps",
+        type=int,
+        default=3,
+        help="早停耐心值；-1 关闭早停。该值表示允许多少次验证不提升后停止。",
+    )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--scaler-type", default="robust", choices=["identity", "standard", "robust"])
 
+    parser.add_argument("--cls-loss", choices=["mse", "mae", "huber"], default="mse")
+    parser.add_argument("--cls-huber-delta", type=float, default=1.0)
     parser.add_argument("--reg-loss", choices=["mse", "mae", "huber"], default="huber")
     parser.add_argument("--huber-delta", type=float, default=5.0)
-
-    parser.add_argument("--pos-weight", default="auto", help="'auto' 或数值")
-    parser.add_argument("--pos-weight-cap", type=float, default=10.0, help="auto pos_weight 上限")
 
     parser.add_argument("--use-calibrated-prob", action="store_true", help="使用 Platt 校准后的概率选阈值/门控")
     parser.add_argument("--calib-max-iter", type=int, default=30)
     parser.add_argument("--calib-sample", type=int, default=200_000)
+
+    # W&B (optional)
+    parser.add_argument("--wandb-project", default="", help="启用 W&B：填写 project 名；留空则关闭。")
+    parser.add_argument("--wandb-entity", default="", help="可选：W&B entity/团队。")
+    parser.add_argument("--wandb-run-name", default="patchtst-2stage-v2", help="W&B run 名称。")
+    parser.add_argument("--wandb-tags", default="patchtst,2stage", help="逗号分隔 tags。")
+    parser.add_argument("--wandb-dir", default=".", help="W&B 本地缓存目录。")
+    parser.add_argument("--log-every-n-steps", type=int, default=50, help="Lightning logger 记录频率。")
 
     parser.add_argument(
         "--threshold-grid",
