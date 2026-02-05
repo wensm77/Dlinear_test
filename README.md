@@ -166,6 +166,24 @@ python src/train_patchtst_two_stage.py \
   --metrics-output ./metrics_patchtst_2stage.csv
 ```
 
+## 9.1) PatchTST 两阶段 v2（BCE分类 + 概率校准 + log回归）
+
+在“纯销量”前提下进一步提升 0/非0 判定稳定性：
+
+```bash
+python src/train_patchtst_two_stage_v2.py \
+  --data ./data/data_cleaned.csv \
+  --horizon 1 \
+  --input-size 24 \
+  --n-windows 6 \
+  --step-size 1 \
+  --patch-len 4 \
+  --stride 2 \
+  --use-calibrated-prob \
+  --cv-output ./forecast_results_patchtst_2stage_v2.csv \
+  --metrics-output ./metrics_patchtst_2stage_v2.csv
+```
+
 ## 10) 两阶段模型按月评测（简版）
 
 ```bash

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .pycache/
 lightning_logs/
+analysis/
 
 # generated outputs
 data/data_cleaned.csv
@@ -30,3 +31,5 @@ metrics_patchtst_daily.csv
 forecast_results_tft.csv
 metrics_tft.csv
 tft_monthly_eval.csv
+forecast_results_patchtst_2stage_v2.csv
+metrics_patchtst_2stage_v2.csv
