@@ -175,6 +175,15 @@ python demo.py \
   --output ./patchtst_2stage_monthly_eval.csv
 ```
 
+TFT 结果评测示例：
+
+```bash
+python demo.py \
+  --input ./forecast_results_tft.csv \
+  --pred-col yhat_tft_hybrid \
+  --output ./tft_monthly_eval.csv
+```
+
 输出字段（按月份一行）：
 
 - `business_accuracy`（严格按你的公式）
@@ -206,4 +215,18 @@ python src/train_patchtst_daily.py \
   --stride 15 \
   --cv-output ./forecast_results_patchtst_daily.csv \
   --metrics-output ./metrics_patchtst_daily.csv
+```
+
+## 12) TFT（月度特征，支持外生变量）
+
+```bash
+python src/train_tft_exog.py \
+  --data ./data/monthly_feature_panel.csv \
+  --horizon 1 \
+  --input-size 24 \
+  --n-windows 6 \
+  --step-size 1 \
+  --hidden-size 64 \
+  --cv-output ./forecast_results_tft.csv \
+  --metrics-output ./metrics_tft.csv
 ```

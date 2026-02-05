@@ -80,7 +80,7 @@ def auto_pred_col(df: pd.DataFrame, pred_col: Optional[str]) -> str:
             raise ValueError(f"pred_col={pred_col} 不存在于输入文件。")
         return pred_col
 
-    for c in ["yhat_two_stage", "PatchTST", "yhat_hybrid", "DLinear", "NBEATS"]:
+    for c in ["yhat_two_stage", "yhat_tft_hybrid", "TFT", "PatchTST", "yhat_hybrid", "DLinear", "NBEATS"]:
         if c in df.columns:
             return c
     raise ValueError("未找到默认预测列，请通过 --pred-col 指定。")
