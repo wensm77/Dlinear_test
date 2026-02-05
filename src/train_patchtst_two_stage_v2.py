@@ -127,6 +127,8 @@ def parse_threshold_grid(s: str):
 
 
 def run_cv_patchtst(df: pd.DataFrame, args, loss):
+    # NOTE: NeuralForecast models are step-driven (max_steps). In many setups the "epoch"
+    # counter in logs stays at 0/1 because the trainer stops by steps, which is expected.
     trainer_kwargs = {}
     if args.wandb_project:
         trainer_kwargs["logger"] = args._wandb_logger  # set at runtime
