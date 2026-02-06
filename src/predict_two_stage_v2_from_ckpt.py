@@ -94,8 +94,13 @@ def main(args):
             out_rows.append(tmp)
             continue
 
-        cls_pred = nf_cls.predict(df=h).rename(columns={"cls": "score_nonzero"})
-        reg_pred = nf_reg.predict(df=h).rename(columns={"reg": "yhat_log"})
+        h_cls = h.copy()
+        h_cls["y"] = (h_cls["y"] > 0).astype(float)
+        h_reg = h.copy()
+        h_reg["y"] = np.log1p(h_reg["y"])
+
+        cls_pred = nf_cls.predict(df=h_cls).rename(columns={"cls": "score_nonzero"})
+        reg_pred = nf_reg.predict(df=h_reg).rename(columns={"reg": "yhat_log"})
 
         m = cls_pred.merge(reg_pred, on=["unique_id", "ds"], how="inner")
         m["cutoff"] = pd.Timestamp(cutoff)
@@ -165,4 +170,3 @@ if __name__ == "__main__":
     p.add_argument("--threshold-fallback", type=float, default=0.5)
 
     main(p.parse_args())
-
