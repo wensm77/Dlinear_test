@@ -26,6 +26,17 @@ def parse_yyyymm(x) -> pd.Timestamp:
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
+def pick_prediction_column(pred_df: pd.DataFrame, alias: str):
+    if alias in pred_df.columns:
+        return alias
+    if f"{alias}-median" in pred_df.columns:
+        return f"{alias}-median"
+    meta_cols = {"unique_id", "ds", "cutoff"}
+    candidate_cols = [c for c in pred_df.columns if c not in meta_cols]
+    if not candidate_cols:
+        raise ValueError(f"无法在预测输出中找到数值列，columns={pred_df.columns.tolist()}")
+    return candidate_cols[0]
+
 
 def acc(f, a):
     if f == 0 and a == 0:
@@ -69,16 +80,11 @@ def main(args):
 
     # Prediction per cutoff group: uses data <= cutoff, predicts ds=cutoff+1 month (h=1).
     out_rows = []
+    req_total = len(req)
     for cutoff, g in req.groupby("cutoff", sort=True):
         ids = g["unique_id"].unique().tolist()
         h = hist[(hist["unique_id"].isin(ids)) & (hist["ds"] <= cutoff)].copy()
         if h.empty:
-            # keep rows with NaNs
-            tmp = g.copy()
-            tmp["pred"] = np.nan
-            tmp["pred_nonzero_prob"] = np.nan
-            tmp["pred_reg"] = np.nan
-            out_rows.append(tmp)
             continue
 
         # Require at least input_size points to build a prediction window.
@@ -87,29 +93,32 @@ def main(args):
         ok = c[c >= input_size].index
         h = h[h["unique_id"].isin(ok)].copy()
         if h.empty:
-            tmp = g.copy()
-            tmp["pred"] = np.nan
-            tmp["pred_nonzero_prob"] = np.nan
-            tmp["pred_reg"] = np.nan
-            out_rows.append(tmp)
             continue
+
+        reg_target_transform = str(params.get("reg_target_transform", "log1p")).lower()
 
         h_cls = h.copy()
         h_cls["y"] = (h_cls["y"] > 0).astype(float)
         h_reg = h.copy()
-        h_reg["y"] = np.log1p(h_reg["y"])
+        if reg_target_transform == "log1p":
+            h_reg["y"] = np.log1p(h_reg["y"])
+        else:
+            h_reg["y"] = pd.to_numeric(h_reg["y"], errors="coerce").fillna(0.0).clip(lower=0.0)
 
-        cls_pred = nf_cls.predict(df=h_cls).rename(columns={"cls": "score_nonzero"})
-        reg_pred = nf_reg.predict(df=h_reg).rename(columns={"reg": "yhat_log"})
+        cls_pred_raw = nf_cls.predict(df=h_cls)
+        reg_pred_raw = nf_reg.predict(df=h_reg)
+        cls_col = pick_prediction_column(cls_pred_raw, "cls")
+        reg_col = pick_prediction_column(reg_pred_raw, "reg")
+        cls_pred = cls_pred_raw.rename(columns={cls_col: "score_nonzero"})
+        reg_pred = reg_pred_raw.rename(columns={reg_col: "yhat_reg_model"})
 
         m = cls_pred.merge(reg_pred, on=["unique_id", "ds"], how="inner")
         m["cutoff"] = pd.Timestamp(cutoff)
 
-        # Only keep ds that are requested in this cutoff group.
-        targets = g[["unique_id", "target_ds"]].drop_duplicates()
-        targets = targets.rename(columns={"target_ds": "ds"})
-        m = targets.merge(m, on=["unique_id", "ds"], how="left")
 
+        # Keep only requested ds that have predictions.
+        targets = g[["unique_id", "target_ds"]].rename(columns={"target_ds": "ds"})
+        m = targets.merge(m, on=["unique_id", "ds"], how="inner")
         score = m["score_nonzero"].to_numpy(dtype=float)
         p_raw = np.clip(score, 0.0, 1.0)
         a = params.get("platt_a", None)
@@ -119,7 +128,12 @@ def main(args):
         else:
             p = p_raw
 
-        yhat_reg = np.expm1(m["yhat_log"].to_numpy(dtype=float)).clip(min=0.0)
+        if reg_target_transform == "log1p":
+            yhat_reg = np.expm1(m["yhat_reg_model"].to_numpy(dtype=float)).clip(min=0.0)
+        else:
+            yhat_reg = pd.to_numeric(
+                m["yhat_reg_model"], errors="coerce"
+            ).fillna(0.0).to_numpy(dtype=float).clip(min=0.0)
         t = params.get("selected_threshold", None)
         if t is None:
             t = float(args.threshold_fallback)
@@ -129,11 +143,22 @@ def main(args):
         m["pred_reg"] = yhat_reg
         m["pred"] = pred
 
-        tmp = g.merge(m[["unique_id", "ds", "pred", "pred_nonzero_prob", "pred_reg"]], left_on=["unique_id", "target_ds"], right_on=["unique_id", "ds"], how="left")
+        tmp = g.merge(
+            m[["unique_id", "ds", "pred", "pred_nonzero_prob", "pred_reg"]],
+            left_on=["unique_id", "target_ds"],
+            right_on=["unique_id", "ds"],
+            how="inner",
+        )
         tmp = tmp.drop(columns=["ds"])
         out_rows.append(tmp)
 
-    out = pd.concat(out_rows, ignore_index=True)
+    if out_rows:
+        out = pd.concat(out_rows, ignore_index=True)
+    else:
+        out = req.iloc[0:0].copy()
+        out["pred"] = pd.Series(dtype=float)
+        out["pred_nonzero_prob"] = pd.Series(dtype=float)
+        out["pred_reg"] = pd.Series(dtype=float)
 
     # Optional: compute business accuracy if actual exists.
     if args.col_actual and args.col_actual in out.columns:
@@ -148,7 +173,9 @@ def main(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(out_path, index=False, encoding="utf-8")
     print(f"saved: {out_path}")
-    print(f"rows={len(out)} matched_history={int(out['in_history'].sum())}/{len(out)}")
+    print(f"rows={len(out)} dropped_unpredicted={req_total - len(out)}")
+    if len(out) > 0 and "in_history" in out.columns:
+        print(f"matched_history={int(out['in_history'].sum())}/{len(out)}")
 
 
 if __name__ == "__main__":

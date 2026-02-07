@@ -58,20 +58,44 @@ def main(args):
         if c not in df.columns:
             raise ValueError(f"缺少列: {c}. 实际列: {list(df.columns)}")
 
-    pred = _zeroify(_to_float(df[args.pred_col]), args.zero_eps)
-    actual = _zeroify(_to_float(df[args.actual_col]), args.zero_eps)
+    pred_raw = _zeroify(_to_float(df[args.pred_col]), args.zero_eps)
+    actual_raw = _zeroify(_to_float(df[args.actual_col]), args.zero_eps)
 
-    valid = np.isfinite(pred) & np.isfinite(actual)
-    df = df.loc[valid].copy()
-    pred = pred[valid]
-    actual = actual[valid]
+    actual_valid = np.isfinite(actual_raw)
+    pred_missing_mask = ~np.isfinite(pred_raw)
+    if args.missing_pred_policy == "drop":
+        valid = np.isfinite(pred_raw) & actual_valid
+        pred = pred_raw[valid]
+        actual = actual_raw[valid]
+        df = df.loc[valid].copy()
+        pred_was_missing = pred_missing_mask[valid]
+    else:
+        # strict mode: keep rows with valid actual; missing pred is treated as 0
+        valid = actual_valid
+        df = df.loc[valid].copy()
+        pred = pred_raw[valid]
+        actual = actual_raw[valid]
+        pred_was_missing = pred_missing_mask[valid]
+        pred[~np.isfinite(pred)] = 0.0
 
     accs = acc_vectorized(pred, actual)
     df["_acc"] = accs
     df["_actual_zero"] = (actual == 0).astype(int)
     df["_pred_zero"] = (pred == 0).astype(int)
+    df["_actual_num"] = actual
+    df["_pred_num"] = pred
+    df["_pred_was_missing"] = pred_was_missing.astype(int)
+
+    total_rows = len(actual_raw)
+    rows_actual_valid = int(actual_valid.sum())
+    rows_missing_pred_before = int((~np.isfinite(pred_raw) & actual_valid).sum())
+    rows_used = len(df)
 
     overall = {
+        "total_rows": int(total_rows),
+        "rows_actual_valid": rows_actual_valid,
+        "rows_missing_pred_before_fill": rows_missing_pred_before,
+        "rows_used": int(rows_used),
         "rows": int(len(df)),
         "business_accuracy": float(accs.mean()) if len(accs) else np.nan,
         "business_accuracy_nonzero": float(accs[actual > 0].mean()) if (actual > 0).any() else np.nan,
@@ -97,7 +121,7 @@ def main(args):
         print(f"- {k}: {overall.get(k)}")
 
     if args.month_col and args.month_col in df.columns:
-        actual_s = pd.to_numeric(df[args.actual_col], errors="coerce")
+        actual_s = df["_actual_num"]
         g = (
             df.groupby(args.month_col, dropna=False)
             .agg(
@@ -106,6 +130,7 @@ def main(args):
                 business_accuracy_nonzero=("_acc", lambda s: float(s[actual_s.loc[s.index] > 0].mean()) if (actual_s.loc[s.index] > 0).any() else np.nan),
                 count_actual_zero=("_actual_zero", "sum"),
                 count_pred_zero=("_pred_zero", "sum"),
+                count_missing_pred_before_fill=("_pred_was_missing", "sum"),
             )
             .reset_index()
         )
@@ -126,5 +151,11 @@ if __name__ == "__main__":
     p.add_argument("--month-col", default="M月份", help="月份列名（可选，用于按月汇总）")
     p.add_argument("--encoding", default="utf-8", help="utf-8 / utf-8-sig / gbk 等")
     p.add_argument("--zero-eps", type=float, default=1e-9, help="将 |x|<=eps 的值视为 0，避免浮点误差")
+    p.add_argument(
+        "--missing-pred-policy",
+        choices=["zero", "drop"],
+        default="zero",
+        help="预测缺失（pred=NaN）如何处理：zero=按0计入评测（默认，严格）；drop=丢弃该行。",
+    )
     p.add_argument("--output", default="", help="可选：保存按月汇总 CSV 路径；留空则直接打印")
     main(p.parse_args())
